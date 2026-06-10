@@ -113,10 +113,11 @@ private:
 
   bool fetchPower(float &powerW) {
     if (host.length() == 0) return false;
-    if (WiFi.status() != WL_CONNECTED) return false;
+    if (!WLED_CONNECTED || WiFi.status() != WL_CONNECTED) return false;
 
     WiFiClient client;
     HTTPClient http;
+    client.setTimeout(750);
 
     String url = "http://" + host + "/api/v1/data";
 
@@ -125,7 +126,7 @@ private:
       return false;
     }
 
-    http.setTimeout(1500);
+    http.setTimeout(750);
 
     int httpCode = http.GET();
     lastHttpCode = httpCode;
@@ -224,13 +225,13 @@ public:
 
     bool configComplete = !top.isNull();
 
-    configComplete &= getJsonValue(top["enabled"], enabled, true);
-    configComplete &= getJsonValue(top["host"], host, "192.168.1.100");
-    configComplete &= getJsonValue(top["updateIntervalMs"], updateIntervalMs, 2000);
-    configComplete &= getJsonValue(top["deadbandW"], deadbandW, 75);
-    configComplete &= getJsonValue(top["fullScaleW"], fullScaleW, 2500);
-    configComplete &= getJsonValue(top["targetBrightness"], targetBrightness, 160);
-    configComplete &= getJsonValue(top["forceStaticEffect"], forceStaticEffect, true);
+    configComplete &= getJsonValue(top["enabled"], enabled, enabled);
+    configComplete &= getJsonValue(top["host"], host, host);
+    configComplete &= getJsonValue(top["updateIntervalMs"], updateIntervalMs, updateIntervalMs);
+    configComplete &= getJsonValue(top["deadbandW"], deadbandW, deadbandW);
+    configComplete &= getJsonValue(top["fullScaleW"], fullScaleW, fullScaleW);
+    configComplete &= getJsonValue(top["targetBrightness"], targetBrightness, targetBrightness);
+    configComplete &= getJsonValue(top["forceStaticEffect"], forceStaticEffect, forceStaticEffect);
 
     updateIntervalMs = max<uint32_t>(500, updateIntervalMs);
     deadbandW = max(0, deadbandW);
