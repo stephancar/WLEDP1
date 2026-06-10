@@ -4,7 +4,6 @@
 
 #include <WiFiClient.h>
 #include <HTTPClient.h>
-#include <ArduinoJson.h>
 
 /*
   HomeWizard P1 Color usermod for WLED
@@ -29,7 +28,7 @@ class HomeWizardP1Color : public Usermod {
 private:
   static const char _name[];
 
-  bool enabled = true;
+  bool enabled = false;
 
   // Set this in WLED Usermod Settings after flashing
   String host = "192.168.1.100";
@@ -99,11 +98,7 @@ private:
     lastG = g;
     lastB = b;
 
-    // Set primary color
-    col[0] = r;
-    col[1] = g;
-    col[2] = b;
-    col[3] = 0;
+    strip.getMainSegment().setColor(0, RGBW32(r, g, b, 0));
 
     if (targetBrightness > 0) {
       bri = targetBrightness;
@@ -113,7 +108,7 @@ private:
       effectCurrent = FX_MODE_STATIC;
     }
 
-    colorUpdated(CALL_MODE_DIRECT_CHANGE);
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
   }
 
   bool fetchPower(float &powerW) {
