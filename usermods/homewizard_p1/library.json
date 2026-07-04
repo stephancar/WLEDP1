@@ -2,5 +2,6 @@
   "name": "homewizard_p1",
   "build": {
     "libArchive": false
-  }
+  },
+  "platforms": ["espressif32"]
 }
