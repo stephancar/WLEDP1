@@ -222,12 +222,15 @@ private:
     }, this);
 
     client->onTimeout([](void *arg, AsyncClient *c, uint32_t time) {
+      // Only flag the failure; do NOT delete here. Deleting runs ~AsyncClient,
+      // whose close fires the onDisconnect callback, which would delete again.
+      // The rx timeout closes the connection shortly after, and onDisconnect
+      // performs the (single) delete.
       HomeWizardP1Usermod *um = (HomeWizardP1Usermod*)arg;
       if (um->client == c) {
         um->client = nullptr;
         um->clientFailed = true;
       }
-      delete c;
     }, this);
 
     client->onError([](void *arg, AsyncClient *c, int8_t error) {
