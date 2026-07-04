@@ -3,6 +3,9 @@
 Visualizes your home's live grid power on a LED strip using a
 [HomeWizard P1 meter](https://www.homewizard.com/p1-meter/) in the same network.
 
+Requires an ESP32 (any variant with WiFi); the networking runs on a dedicated
+FreeRTOS task, which the ESP8266 does not support.
+
 - **Offtake / import** (consuming from the grid): purple pulses flowing toward the segment start; more power = faster and brighter.
 - **Injection / export** (feeding into the grid, e.g. solar): green pulses flowing toward the segment end.
 - **Neutral** (within the deadband around 0 W): calm white breathing.
@@ -16,7 +19,6 @@ Visualizes your home's live grid power on a LED strip using a
 3. In WLED, go to Config → Usermods → HomeWizard P1. With *autoDiscover*
    enabled and *host* left empty, the meter is found automatically via mDNS
    (`_hwenergy._tcp`). Alternatively enter the meter's IP address as *host*.
-   (On ESP8266 discovery is not supported; set *host* manually.)
 4. Select the **Grid Flow** effect on your segment.
 
 ## Settings
@@ -35,6 +37,12 @@ Visualizes your home's live grid power on a LED strip using a
 - **Speed**: scales the overall flow speed (the actual speed also grows with power).
 - **Pulses**: how many pulses travel along the segment.
 - **Trail**: length of the fading tail behind each pulse.
+- **Blur**: softens the pulses for a smoother look.
+
+Tip: white (the neutral state) lights all three LED channels and is the
+maximum-current state. If your device browns out right when the strip turns
+white, set a realistic PSU limit in Config → LED Preferences (ABL), leaving
+~250 mA headroom for the ESP32 itself.
 
 Flow direction is tied to import/export; use the segment's *reverse* option if
 it should run the other way on your physical strip.
