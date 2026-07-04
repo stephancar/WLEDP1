@@ -92,8 +92,10 @@ static void mode_grid_flow(void) {
   // Breathing level: bright when data is valid, dim while waiting for data.
   // p1Presence fades between the two so data loss/recovery is not a hard cut.
   const uint8_t breath = sin8_t(strip.now >> 4);                // ~4 s cycle
+  // Note: the no-data level must stay clearly visible - if it is too dim the
+  // strip looks simply "off" and a data outage is indistinguishable from a fault
   const int breatheValid   = 140 + (breath >> 2);
-  const int breatheInvalid = 30 + (breath >> 3);
+  const int breatheInvalid = 60 + (breath >> 2);
   const int idleLevel = breatheInvalid + (int)((breatheValid - breatheInvalid) * p1Presence);
 
   // Pulse spacing from the density slider (more density = more pulses)
@@ -101,9 +103,10 @@ static void mode_grid_flow(void) {
   unsigned spacing   = max(6U, (unsigned)SEGLEN / numPulses);
   const uint32_t spacingFP = (uint32_t)spacing << 8;
 
-  // Integrate pulse position: flow speed 4..60 px/s scaled by power and the
-  // speed slider; import and export flow in opposite directions
-  float pxPerSec = (4.0f + 56.0f * t) * ((float)(1 + SEGMENT.speed) / 128.0f);
+  // Integrate pulse position: flow speed 2..30 px/s scaled by power and the
+  // speed slider; import and export flow in opposite directions. Deliberately
+  // calm — this is ambient information, not an alarm.
+  float pxPerSec = (2.0f + 28.0f * t) * ((float)(1 + SEGMENT.speed) / 128.0f);
   uint32_t dtMs = (SEGENV.call == 0) ? 0 : (strip.now - SEGENV.step);
   SEGENV.step = strip.now;
   if (dtMs > 200) dtMs = 200;  // clamp huge gaps (effect just (re)started)
@@ -274,12 +277,21 @@ private:
         continue;
       }
       um->fetchOnce(hostBuf);
-      // A discovered meter that stopped answering may have changed IP: forget
-      // it after 20 s of failures so discovery can find it again
-      if (um->taskStatus != ST_OK && millis() - p1LastGoodMs > 20000) {
+      // A discovered meter that stopped answering may have changed IP: retry
+      // discovery in the background, but NEVER forget the last known address.
+      // discoverMeter() only overwrites it on success, so even when mDNS is
+      // broken (e.g. after a WiFi hiccup) the old IP keeps being polled and
+      // the usermod recovers as soon as the meter answers again.
+      if (um->taskStatus != ST_OK && um->autoDiscover &&
+          millis() - p1LastGoodMs > 20000 && millis() - lastDiscoveryMs > 30000) {
+        bool manual = false;
         if (xSemaphoreTake(um->p1Mutex, portMAX_DELAY) == pdTRUE) {
-          if (um->manualHost[0] == '\0') um->discoveredHost[0] = '\0';
+          manual = (um->manualHost[0] != '\0');
           xSemaphoreGive(um->p1Mutex);
+        }
+        if (!manual) {
+          lastDiscoveryMs = millis();
+          um->discoverMeter();
         }
       }
       uint16_t interval = um->updateIntervalMs;
@@ -326,6 +338,10 @@ public:
       p1PowerSmoothW += (powerTarget - p1PowerSmoothW) * a;
       float presenceTarget = p1DataValid ? 1.0f : 0.0f;
       p1Presence += (presenceTarget - p1Presence) * a;
+      // A NaN would poison the filters permanently (NaN + x*a stays NaN);
+      // guard so a bad sample can never freeze the visuals until power cycle
+      if (!isfinite(p1PowerSmoothW)) p1PowerSmoothW = 0.0f;
+      if (!isfinite(p1Presence))     p1Presence = 0.0f;
     }
   }
 
@@ -361,6 +377,12 @@ public:
         case ST_CONN_ERR:  s = String(F("no connection to ")) + hostBuf; break;
         case ST_JSON_ERR:  s = String(F("bad data from ")) + hostBuf; break;
         default:           s = (hostBuf[0] || autoDiscover) ? F("waiting for data...") : F("no host configured");
+      }
+      uint32_t lastGood = p1LastGoodMs;
+      if (lastGood != 0) {
+        s += F(" (last data ");
+        s += (millis() - lastGood) / 1000;
+        s += F(" s ago)");
       }
       info.add(s);
     }
