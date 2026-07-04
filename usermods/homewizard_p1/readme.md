@@ -44,11 +44,22 @@ color fades white → purple/green proportionally with power, and the pulses
 gradually emerge from the neutral breathing rather than snapping in at the
 deadband edge.
 
+## Development: P1 simulator
+
+[`p1_simulator.py`](p1_simulator.py) serves a fake local API v1 on port 8123
+that cycles injection (-800 W) → neutral (10 W) → offtake (+1200 W) every 10
+seconds. Run it on a PC in the same network (`python p1_simulator.py`) and set
+the usermod *host* to `<pc-ip>:8123` to test all states without a real meter.
+Building with `-D WLED_ENABLE_JSONLIVE` additionally lets you verify the
+rendered colors over HTTP via `/json/live`.
+
 ## Technical notes
 
 - Uses the HomeWizard [local API v1](https://api-documentation.homewizard.com/docs/v1/)
   endpoint `GET /api/v1/data`, field `active_power_w` (positive = import, negative = export).
-- The HTTP request is fully asynchronous (AsyncClient). TCP callbacks only
-  buffer data; parsing and all WLED state changes happen on the main loop task.
-- mDNS discovery blocks for a few seconds, so it only runs while no meter is
-  known, with a 30 s retry backoff. The LEDs may pause briefly during discovery.
+- All networking (mDNS discovery and HTTP polling) runs on a dedicated
+  low-priority FreeRTOS task pinned to core 0, so blocking calls can never
+  stall the LED pipeline. The task publishes plain 32-bit values (atomic on
+  ESP32); host strings are exchanged under a mutex. ESP32 only.
+- The pulse position is integrated over time (not derived from `time * speed`),
+  so speed changes shift the animation continuously without jumps.
