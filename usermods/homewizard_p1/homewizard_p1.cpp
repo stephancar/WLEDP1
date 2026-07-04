@@ -36,10 +36,12 @@
 // Written from the main loop only (parsing happens in loop(), not in TCP
 // callbacks), read by the effect on the same task -> no locking needed.
 // ---------------------------------------------------------------------------
-static float p1PowerW      = 0.0f;   // latest active power, >0 import, <0 export
-static bool  p1DataValid   = false;  // false until first fetch or when data is stale
-static int   p1DeadbandW   = 50;     // |power| below this is treated as "neutral"
-static int   p1FullScaleW  = 2500;   // |power| at which color/speed reach maximum
+static float p1PowerW       = 0.0f;   // latest active power, >0 import, <0 export
+static float p1PowerSmoothW = 0.0f;   // low-pass filtered power driving the visuals
+static float p1Presence     = 0.0f;   // 0..1, fades in/out as data becomes (in)valid
+static bool  p1DataValid    = false;  // false until first fetch or when data is stale
+static int   p1DeadbandW    = 50;     // |power| below this is treated as "neutral"
+static int   p1FullScaleW   = 2500;   // |power| at which color/speed reach maximum
 
 // Fixed identity colors (matching common energy-app conventions)
 static const uint32_t P1_COLOR_IMPORT = RGBW32(160,   0, 255, 0); // purple
@@ -59,24 +61,30 @@ static const uint32_t P1_COLOR_IDLE   = RGBW32(255, 255, 255, 0); // white
 static void mode_grid_flow(void) {
   if (SEGLEN < 1) { SEGMENT.fill(SEGCOLOR(0)); return; }
 
-  const float power = p1PowerW;
-  const bool neutral = !p1DataValid || fabsf(power) <= (float)p1DeadbandW;
-
-  if (neutral) {
-    // No data yet or balanced grid: calm white breathing.
-    // While data is missing the breathing is dimmer, so the states are distinguishable.
-    uint8_t breath = sin8_t(strip.now >> 4);                    // ~4 s cycle
-    uint8_t level  = p1DataValid ? (140 + (breath >> 2)) : (30 + (breath >> 3));
-    SEGMENT.fill(color_fade(P1_COLOR_IDLE, level));
-    return;
-  }
-
+  // All rendering is driven by the low-pass filtered power, so poll steps,
+  // deadband crossings and import/export flips all animate smoothly.
+  const float power = p1PowerSmoothW;
   const bool importing = power > 0.0f;
+
   // Normalize |power| to 0..1 between deadband and full scale
   float t = (fabsf(power) - (float)p1DeadbandW) / (float)max(1, p1FullScaleW - p1DeadbandW);
   t = constrain(t, 0.0f, 1.0f);
 
-  const uint32_t baseColor = importing ? P1_COLOR_IMPORT : P1_COLOR_EXPORT;
+  // Pulses gradually emerge from the breathing over the first quarter of the
+  // power range instead of snapping in at the deadband edge
+  const float emerge = constrain(t * 4.0f, 0.0f, 1.0f);
+
+  // Color fades white -> purple (import) / green (export) with power.
+  // A direction flip passes through the deadband, i.e. through white.
+  const uint32_t ident = importing ? P1_COLOR_IMPORT : P1_COLOR_EXPORT;
+  const uint32_t baseColor = color_blend(P1_COLOR_IDLE, ident, (uint8_t)(t * 255.0f));
+
+  // Breathing level: bright when data is valid, dim while waiting for data.
+  // p1Presence fades between the two so data loss/recovery is not a hard cut.
+  const uint8_t breath = sin8_t(strip.now >> 4);                // ~4 s cycle
+  const int breatheValid   = 140 + (breath >> 2);
+  const int breatheInvalid = 30 + (breath >> 3);
+  const int idleLevel = breatheInvalid + (int)((breatheValid - breatheInvalid) * p1Presence);
 
   // Flow speed in pixels/second: 4..60 px/s scaled by power and the speed slider
   float pxPerSec = (4.0f + 56.0f * t) * ((float)(1 + SEGMENT.speed) / 128.0f);
@@ -93,8 +101,8 @@ static void mode_grid_flow(void) {
   unsigned trail = 2 + (((unsigned)SEGMENT.custom1 * (spacing - 2)) >> 8);
   const uint32_t trailFP = (uint32_t)trail << 8;
 
-  // Dim background in the base color so the whole strip shows the state
-  const uint32_t bgColor = color_fade(baseColor, 24);
+  // Pulses get brighter with power
+  const uint8_t pulseBri = 170 + (uint8_t)(85.0f * t);
 
   for (unsigned i = 0; i < SEGLEN; i++) {
     uint32_t posFP = ((uint32_t)i << 8);
@@ -102,17 +110,20 @@ static void mode_grid_flow(void) {
     posFP = importing ? (posFP + offset) : (posFP - offset);
     uint32_t phase = posFP % spacingFP;   // 0 = pulse head
 
-    uint32_t color;
+    // Flow layer brightness: bright head fading along the trail, dim background
+    int flowLevel;
     if (phase < trailFP) {
-      // Head is brightest, tail fades to background level
-      uint8_t level = (uint8_t)(255 - ((phase * (255 - 40)) / trailFP));
-      // More power = brighter pulses overall
-      level = scale8(level, 128 + (uint8_t)(127.0f * t));
-      color = color_fade(baseColor, max((uint8_t)24, level));
+      flowLevel = 255 - (int)((phase * (255 - 40)) / trailFP);
+      flowLevel = scale8((uint8_t)flowLevel, pulseBri);
     } else {
-      color = bgColor;
+      flowLevel = 24;
     }
-    SEGMENT.setPixelColor(i, color);
+
+    // Cross-fade breathing -> flow by emerge for a seamless neutral boundary
+    int level = idleLevel + (int)((flowLevel - idleLevel) * emerge);
+    level = constrain(level, 10, 255);
+
+    SEGMENT.setPixelColor(i, color_fade(baseColor, (uint8_t)level));
   }
 }
 static const char _data_FX_MODE_GRID_FLOW[] PROGMEM = "Grid Flow@Speed,Pulses,Trail;;;1;sx=128,ix=96,c1=128";
@@ -154,6 +165,9 @@ private:
   // Status for the info page
   bool lastFetchOk = false;
   String lastError = "";
+
+  // Timestamp for the visual smoothing filter
+  unsigned long lastSmoothUpdate = 0;
 
   bool haveHost() const { return host.length() > 0 || discoveredHost.length() > 0; }
   String activeHost() const { return host.length() > 0 ? host : discoveredHost; }
@@ -301,6 +315,21 @@ public:
 
   void loop() override {
     if (!enabled || respBuf == nullptr) return;
+
+    // Low-pass filter the power value (and a data-presence factor) toward
+    // their targets with a ~1.2 s time constant. The effect renders from the
+    // filtered values, so 3 s poll steps become smooth ramps instead of jumps.
+    unsigned long now = millis();
+    unsigned long dt = now - lastSmoothUpdate;
+    if (dt > 0) {
+      lastSmoothUpdate = now;
+      if (dt > 1000) dt = 1000;  // avoid a huge first step after boot/reconnect
+      float a = (float)dt / (1200.0f + (float)dt);
+      float powerTarget = p1DataValid ? p1PowerW : 0.0f;  // fade home to neutral when data is lost
+      p1PowerSmoothW += (powerTarget - p1PowerSmoothW) * a;
+      float presenceTarget = p1DataValid ? 1.0f : 0.0f;
+      p1Presence += (presenceTarget - p1Presence) * a;
+    }
 
     // Handle a completed or failed request first (flags set by TCP callbacks)
     if (respComplete) {

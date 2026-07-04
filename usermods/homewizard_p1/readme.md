@@ -39,6 +39,11 @@ Visualizes your home's live grid power on a LED strip using a
 Flow direction is tied to import/export; use the segment's *reverse* option if
 it should run the other way on your physical strip.
 
+All transitions are smooth: the power value is low-pass filtered (~1.2 s), the
+color fades white → purple/green proportionally with power, and the pulses
+gradually emerge from the neutral breathing rather than snapping in at the
+deadband edge.
+
 ## Technical notes
 
 - Uses the HomeWizard [local API v1](https://api-documentation.homewizard.com/docs/v1/)
