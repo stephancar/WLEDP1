@@ -1,5 +1,6 @@
 #include "wled.h"
 
+#include <atomic>
 #ifdef ARDUINO_ARCH_ESP32
 #include <HTTPClient.h>
 #endif
@@ -36,10 +37,11 @@
 
 // ---------------------------------------------------------------------------
 // State shared between the fetch task, the usermod instance and the effect.
-// 32-bit aligned loads/stores are atomic on ESP32; strings use p1Mutex.
+// Scalars crossing the task boundary are std::atomic (lock-free for 32-bit
+// types on ESP32); strings use p1Mutex.
 // ---------------------------------------------------------------------------
-static volatile float    p1PowerW     = 0.0f;  // latest active power, >0 import, <0 export (fetch task)
-static volatile uint32_t p1LastGoodMs = 0;     // millis() of last successful fetch (fetch task)
+static std::atomic<float>    p1PowerW{0.0f};   // latest active power, >0 import, <0 export (fetch task)
+static std::atomic<uint32_t> p1LastGoodMs{0};  // millis() of last successful fetch (fetch task)
 static bool  p1DataValid    = false;           // derived in main loop from p1LastGoodMs
 static float p1PowerSmoothW = 0.0f;            // low-pass filtered power driving the visuals (main loop)
 static float p1Presence     = 0.0f;            // 0..1, fades in/out as data becomes (in)valid (main loop)
@@ -155,15 +157,15 @@ private:
 
   // Configuration (Usermod Settings, main thread)
   bool enabled = true;
-  String host = "";                            // empty = discover via mDNS; may be "host:port"
-  volatile uint16_t updateIntervalMs = 2000;   // poll interval; P1 v1 data updates about once per second
-  volatile bool autoDiscover = true;
-  volatile bool cfgEnabled = true;             // task-visible copy of 'enabled'
+  String host = "";                              // empty = discover via mDNS; may be "host:port"
+  std::atomic<uint16_t> updateIntervalMs{2000};  // poll interval; P1 v1 data updates about once per second
+  std::atomic<bool> autoDiscover{true};
+  std::atomic<bool> cfgEnabled{true};            // task-visible copy of 'enabled'
 
   // Task status codes for the info page
-  enum : int8_t { ST_IDLE = 0, ST_DISCOVERING, ST_OK, ST_HTTP_ERR, ST_CONN_ERR, ST_JSON_ERR, ST_NO_METER };
-  volatile int8_t  taskStatus = ST_IDLE;
-  volatile int16_t taskHttpCode = 0;
+  enum : int8_t { ST_IDLE = 0, ST_DISCOVERING, ST_OK, ST_HTTP_ERR, ST_CONN_ERR, ST_JSON_ERR, ST_NO_METER, ST_TASK_FAIL };
+  std::atomic<int8_t>  taskStatus{ST_IDLE};
+  std::atomic<int16_t> taskHttpCode{0};
 
   // Host strings exchanged between threads, guarded by p1Mutex
   char manualHost[64]     = "";   // copy of 'host' for the task
@@ -173,13 +175,17 @@ private:
   SemaphoreHandle_t p1Mutex = nullptr;
   TaskHandle_t fetchTaskHandle = nullptr;
 
-  void ensureMutex() { if (p1Mutex == nullptr) p1Mutex = xSemaphoreCreateMutex(); }
+  // Creation can fail under memory pressure; callers must handle false
+  bool ensureMutex() {
+    if (p1Mutex == nullptr) p1Mutex = xSemaphoreCreateMutex();
+    return p1Mutex != nullptr;
+  }
 
   // Copy the effective host ("manual wins over discovered") into buf.
   // Returns false when no host is known yet.
   bool getEffectiveHost(char *buf, size_t len) {
     bool have = false;
-    if (xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
+    if (p1Mutex != nullptr && xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
       if (manualHost[0] != '\0')          { strlcpy(buf, manualHost, len); have = true; }
       else if (discoveredHost[0] != '\0') { strlcpy(buf, discoveredHost, len); have = true; }
       xSemaphoreGive(p1Mutex);
@@ -203,7 +209,7 @@ private:
     if (found < 0 && n > 0) found = 0;  // no explicit P1: fall back to the first device
     if (found >= 0) {
       String ip = MDNS.IP(found).toString();
-      if (xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
+      if (p1Mutex != nullptr && xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
         strlcpy(discoveredHost, ip.c_str(), sizeof(discoveredHost));
         xSemaphoreGive(p1Mutex);
       }
@@ -221,7 +227,17 @@ private:
     strlcpy(hostName, hostSpec, sizeof(hostName));
     uint16_t port = 80;
     char *colon = strchr(hostName, ':');
-    if (colon != nullptr) { *colon = '\0'; port = atoi(colon + 1); }
+    if (colon != nullptr) {
+      *colon = '\0';
+      char *end = nullptr;
+      long parsedPort = strtol(colon + 1, &end, 10);
+      // Reject malformed or out-of-range ports instead of silently wrapping
+      if (hostName[0] == '\0' || end == colon + 1 || *end != '\0' || parsedPort <= 0 || parsedPort > 65535) {
+        taskStatus = ST_CONN_ERR;
+        return;
+      }
+      port = (uint16_t)parsedPort;
+    }
 
     WiFiClient wifiClient;
     HTTPClient http;
@@ -239,15 +255,15 @@ private:
       taskStatus = (code > 0) ? ST_HTTP_ERR : ST_CONN_ERR;
       return;
     }
-    String payload = http.getString();
-    http.end();
-
-    // Only extract the field we need; the filter keeps memory usage small
+    // Parse straight from the stream (no full-body buffering); the filter
+    // only extracts the field we need and keeps memory usage small
     StaticJsonDocument<64> filter;
     filter["active_power_w"] = true;
     StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
-    if (err || !doc.containsKey("active_power_w")) {
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+    // is<float>() also rejects "active_power_w": null (present but not numeric)
+    if (err || !doc["active_power_w"].is<float>()) {
       taskStatus = ST_JSON_ERR;
       return;
     }
@@ -285,7 +301,7 @@ private:
       if (um->taskStatus != ST_OK && um->autoDiscover &&
           millis() - p1LastGoodMs > 20000 && millis() - lastDiscoveryMs > 30000) {
         bool manual = false;
-        if (xSemaphoreTake(um->p1Mutex, portMAX_DELAY) == pdTRUE) {
+        if (um->p1Mutex != nullptr && xSemaphoreTake(um->p1Mutex, portMAX_DELAY) == pdTRUE) {
           manual = (um->manualHost[0] != '\0');
           xSemaphoreGive(um->p1Mutex);
         }
@@ -307,19 +323,33 @@ public:
   void setup() override {
     strip.addEffect(255, &mode_grid_flow, _data_FX_MODE_GRID_FLOW);
 #ifdef ARDUINO_ARCH_ESP32
-    ensureMutex();
+    if (!ensureMutex()) {
+      taskStatus = ST_TASK_FAIL;  // out of memory; surfaced on the info page
+      return;
+    }
     if (xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
       strlcpy(manualHost, host.c_str(), sizeof(manualHost));
       xSemaphoreGive(p1Mutex);
     }
     cfgEnabled = enabled;
     // Low priority, pinned to core 0 (WLED's LED loop runs on core 1)
-    xTaskCreatePinnedToCore(fetchTask, "P1Fetch", 10240, this, 1, &fetchTaskHandle, 0);
+    if (xTaskCreatePinnedToCore(fetchTask, "P1Fetch", 10240, this, 1, &fetchTaskHandle, 0) != pdPASS) {
+      fetchTaskHandle = nullptr;
+      taskStatus = ST_TASK_FAIL;
+      DEBUG_PRINTLN(F("P1: fetch task creation failed"));
+    }
 #endif
   }
 
   void loop() override {
-    if (!enabled) return;
+    if (!enabled) {
+      // Reset the visuals so a disabled usermod doesn't keep showing stale
+      // import/export state through the still-registered effect
+      p1DataValid = false;
+      p1PowerSmoothW = 0.0f;
+      p1Presence = 0.0f;
+      return;
+    }
 
     // Data is valid when the last successful fetch is recent
     uint32_t lastGood = p1LastGoodMs;
@@ -373,7 +403,7 @@ public:
       switch (taskStatus) {
         case ST_DISCOVERING:
         case ST_NO_METER:  s = F("searching for P1 meter..."); break;
-        case ST_HTTP_ERR:  s = String(F("HTTP ")) + taskHttpCode; s += F(" from "); s += hostBuf; break;
+        case ST_HTTP_ERR:  s = String(F("HTTP ")) + taskHttpCode.load(); s += F(" from "); s += hostBuf; break;
         case ST_CONN_ERR:  s = String(F("no connection to ")) + hostBuf; break;
         case ST_JSON_ERR:  s = String(F("bad data from ")) + hostBuf; break;
         default:           s = (hostBuf[0] || autoDiscover) ? F("waiting for data...") : F("no host configured");
@@ -393,8 +423,8 @@ public:
     JsonObject top = root.createNestedObject(FPSTR(_name));
     top["enabled"] = enabled;
     top["host"] = host;
-    top["autoDiscover"] = (bool)autoDiscover;
-    top["updateIntervalMs"] = updateIntervalMs;
+    top["autoDiscover"] = autoDiscover.load();
+    top["updateIntervalMs"] = updateIntervalMs.load();
     top["deadbandW"] = p1DeadbandW;
     top["fullScaleW"] = p1FullScaleW;
   }
@@ -416,8 +446,10 @@ public:
     autoDiscover = ad;
     updateIntervalMs = max((uint16_t)1000, iv);
     cfgEnabled = enabled;
-    p1DeadbandW = max(0, p1DeadbandW);
-    p1FullScaleW = max(p1DeadbandW + 1, p1FullScaleW);
+    // Clamp deadband before deriving the full-scale floor so deadband+1
+    // cannot overflow; 1 MW is a generous ceiling for a home connection
+    p1DeadbandW = constrain(p1DeadbandW, 0, 100000);
+    p1FullScaleW = constrain(p1FullScaleW, p1DeadbandW + 1, 1000000);
     host.trim();
 
 #ifdef ARDUINO_ARCH_ESP32
