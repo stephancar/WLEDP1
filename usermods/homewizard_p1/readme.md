@@ -48,13 +48,17 @@ strip turns white:
 - **Device browns out / reboots at the white transition**: set a realistic
   PSU limit in Config → LED Preferences (ABL), leaving ~250 mA headroom for
   the ESP32 itself.
-- **Light switches itself off (and maybe shows a random color) and stays off
-  until a power cycle**: the current step can couple electrical noise into
-  GPIO0, where WLED's default button lives — phantom "presses" toggle the
-  power off (and a phantom long-press sets a random color). Once off, no
-  current flows, so no phantom press ever turns it back on. If you don't use
-  a physical button, remove the GPIO0 button in Config → LED Preferences →
-  buttons (set it to disabled), or move it to another pin.
+- **Light switches itself off or changes color, seemingly at power
+  transitions**: check for external controllers before suspecting hardware.
+  A Home Assistant automation (or another WLED syncing via UDP, Alexa, an IR
+  remote) that reacts to the same meter will fire at the exact moments this
+  usermod changes state, making it look like the usermod is at fault. This
+  is especially likely if you experimented with meter-triggered automations
+  before installing this usermod. Diagnosis tips: `state.on == false` in
+  `/json/state` means something commanded "off" (a crash cannot do that);
+  a `WLED_DEBUG` build logs incoming UDP sync senders, and repeated
+  `Not-Found HTTP call: /presets.json` lines in the debug serial reveal a
+  connected Home Assistant WLED integration.
 - **Device freezes hard (unreachable, serial silent, no crash log) when large
   appliances switch**: mains transients from multi-kW loads can latch up the
   ESP32 — inherently more likely with this usermod, since your light is by
