@@ -39,10 +39,22 @@ FreeRTOS task, which the ESP8266 does not support.
 - **Trail**: length of the fading tail behind each pulse.
 - **Blur**: softens the pulses for a smoother look.
 
-Tip: white (the neutral state) lights all three LED channels and is the
-maximum-current state. If your device browns out right when the strip turns
-white, set a realistic PSU limit in Config → LED Preferences (ABL), leaving
-~250 mA headroom for the ESP32 itself.
+## Troubleshooting
+
+White (the neutral state) lights all three LED channels and is the
+maximum-current state, so power problems tend to show up exactly when the
+strip turns white:
+
+- **Device browns out / reboots at the white transition**: set a realistic
+  PSU limit in Config → LED Preferences (ABL), leaving ~250 mA headroom for
+  the ESP32 itself.
+- **Light switches itself off (and maybe shows a random color) and stays off
+  until a power cycle**: the current step can couple electrical noise into
+  GPIO0, where WLED's default button lives — phantom "presses" toggle the
+  power off (and a phantom long-press sets a random color). Once off, no
+  current flows, so no phantom press ever turns it back on. If you don't use
+  a physical button, remove the GPIO0 button in Config → LED Preferences →
+  buttons (set it to disabled), or move it to another pin.
 
 Flow direction is tied to import/export; use the segment's *reverse* option if
 it should run the other way on your physical strip.
