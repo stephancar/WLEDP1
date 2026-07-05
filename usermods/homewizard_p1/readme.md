@@ -55,6 +55,14 @@ strip turns white:
   current flows, so no phantom press ever turns it back on. If you don't use
   a physical button, remove the GPIO0 button in Config → LED Preferences →
   buttons (set it to disabled), or move it to another pin.
+- **Device freezes hard (unreachable, serial silent, no crash log) when large
+  appliances switch**: mains transients from multi-kW loads can latch up the
+  ESP32 — inherently more likely with this usermod, since your light is by
+  definition near big switching loads. Mitigate in hardware (330 Ω series
+  resistor in the data line, ≥1000 µF capacitor across the strip's 5 V input,
+  short data wires, a 74AHCT125 level shifter) and build with
+  `-D WLED_WATCHDOG_TIMEOUT=10` so any remaining freeze self-recovers by
+  reboot instead of waiting for a power cycle.
 
 Flow direction is tied to import/export; use the segment's *reverse* option if
 it should run the other way on your physical strip.
