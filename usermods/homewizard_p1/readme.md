@@ -41,32 +41,20 @@ FreeRTOS task, which the ESP8266 does not support.
 
 ## Troubleshooting
 
-White (the neutral state) lights all three LED channels and is the
-maximum-current state, so power problems tend to show up exactly when the
-strip turns white:
+One pitfall specific to this usermod: it changes the light at the exact
+moments your household power changes, so *unrelated* problems that are also
+triggered by power changes look like usermod bugs. In particular, if you
+experimented with meter-triggered automations (e.g. Home Assistant) before
+installing this usermod, a leftover automation will fight it at every
+import/export transition. If the light switches off or shows unexpected
+colors, check `/json/state` first: `"on": false` means something *commanded*
+the light off — the usermod never changes power, brightness or segment
+colors, so look for an external controller.
 
-- **Device browns out / reboots at the white transition**: set a realistic
-  PSU limit in Config → LED Preferences (ABL), leaving ~250 mA headroom for
-  the ESP32 itself.
-- **Light switches itself off or changes color, seemingly at power
-  transitions**: check for external controllers before suspecting hardware.
-  A Home Assistant automation (or another WLED syncing via UDP, Alexa, an IR
-  remote) that reacts to the same meter will fire at the exact moments this
-  usermod changes state, making it look like the usermod is at fault. This
-  is especially likely if you experimented with meter-triggered automations
-  before installing this usermod. Diagnosis tips: `state.on == false` in
-  `/json/state` means something commanded "off" (a crash cannot do that);
-  a `WLED_DEBUG` build logs incoming UDP sync senders, and repeated
-  `Not-Found HTTP call: /presets.json` lines in the debug serial reveal a
-  connected Home Assistant WLED integration.
-- **Device freezes hard (unreachable, serial silent, no crash log) when large
-  appliances switch**: mains transients from multi-kW loads can latch up the
-  ESP32 — inherently more likely with this usermod, since your light is by
-  definition near big switching loads. Mitigate in hardware (330 Ω series
-  resistor in the data line, ≥1000 µF capacitor across the strip's 5 V input,
-  short data wires, a 74AHCT125 level shifter) and build with
-  `-D WLED_WATCHDOG_TIMEOUT=10` so any remaining freeze self-recovers by
-  reboot instead of waiting for a power cycle.
+Also note that white (the neutral state) lights all three LED channels and is
+therefore the highest-current state this usermod produces; an undersized
+power supply shows up exactly at the neutral transition. See the general
+WLED documentation on ABL/current limiting if that matches your symptoms.
 
 Flow direction is tied to import/export; use the segment's *reverse* option if
 it should run the other way on your physical strip.

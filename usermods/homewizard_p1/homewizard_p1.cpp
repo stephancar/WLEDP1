@@ -1,9 +1,7 @@
 #include "wled.h"
 
 #include <atomic>
-#ifdef ARDUINO_ARCH_ESP32
 #include <HTTPClient.h>
-#endif
 
 /*
  * HomeWizard P1 usermod (ESP32 only)
@@ -23,10 +21,10 @@
  *
  * Architecture:
  *  - All networking (mDNS discovery + HTTP polling) runs on a dedicated
- *    low-priority FreeRTOS task pinned to core 0, the same pattern the
- *    audioreactive usermod uses for its processing task. Blocking calls there
- *    cannot stall the LED pipeline on the main loop task, and there is no
- *    async client lifecycle to race on.
+ *    low-priority FreeRTOS task, the same pattern the audioreactive usermod
+ *    uses for its processing task. Blocking calls there cannot stall the LED
+ *    pipeline on the main loop task, and there is no async client lifecycle
+ *    to race on. ESP32 only (platform restriction in library.json).
  *  - The task publishes plain 32-bit values (atomic on ESP32); host strings
  *    are exchanged under a FreeRTOS mutex, per docs/cpp.instructions.md.
  *  - The main loop low-pass filters the power value; the effect renders only
@@ -42,6 +40,7 @@
 // ---------------------------------------------------------------------------
 static std::atomic<float>    p1PowerW{0.0f};   // latest active power, >0 import, <0 export (fetch task)
 static std::atomic<uint32_t> p1LastGoodMs{0};  // millis() of last successful fetch (fetch task)
+static bool p1Enabled = false;                 // usermod running; main thread only (loop + effect)
 static bool  p1DataValid    = false;           // derived in main loop from p1LastGoodMs
 static float p1PowerSmoothW = 0.0f;            // low-pass filtered power driving the visuals (main loop)
 static float p1Presence     = 0.0f;            // 0..1, fades in/out as data becomes (in)valid (main loop)
@@ -65,7 +64,8 @@ static const uint32_t P1_COLOR_IDLE   = RGBW32(255, 255, 255, 0); // white
 // option to flip it for your physical layout.
 // ---------------------------------------------------------------------------
 static void mode_grid_flow(void) {
-  if (SEGLEN < 1) { SEGMENT.fill(SEGCOLOR(0)); return; }
+  // Usermod disabled or failed to initialize: fall back to the segment color
+  if (!p1Enabled || SEGLEN < 1) { SEGMENT.fill(SEGCOLOR(0)); return; }
   // Per-segment fractional pulse position, so speed changes shift the pattern
   // continuously (position is integrated, never recomputed from time * speed)
   if (!SEGENV.allocateData(sizeof(float))) { SEGMENT.fill(SEGCOLOR(0)); return; }
@@ -171,21 +171,19 @@ private:
   char manualHost[64]     = "";   // copy of 'host' for the task
   char discoveredHost[48] = "";   // written by the task after mDNS discovery
 
-#ifdef ARDUINO_ARCH_ESP32
   SemaphoreHandle_t p1Mutex = nullptr;
   TaskHandle_t fetchTaskHandle = nullptr;
+  std::atomic<uint32_t> taskStackFree{0};  // task stack headroom in bytes, for diagnostics
 
-  // Creation can fail under memory pressure; callers must handle false
-  bool ensureMutex() {
-    if (p1Mutex == nullptr) p1Mutex = xSemaphoreCreateMutex();
-    return p1Mutex != nullptr;
-  }
+  // Mutex sections only copy small strings, so a short bounded wait suffices;
+  // on timeout the caller skips this cycle and retries on the next one
+  static constexpr TickType_t MUTEX_WAIT = pdMS_TO_TICKS(50);
 
   // Copy the effective host ("manual wins over discovered") into buf.
-  // Returns false when no host is known yet.
+  // Returns false when no host is known (or the mutex is briefly contended).
   bool getEffectiveHost(char *buf, size_t len) {
     bool have = false;
-    if (p1Mutex != nullptr && xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(p1Mutex, MUTEX_WAIT) == pdTRUE) {
       if (manualHost[0] != '\0')          { strlcpy(buf, manualHost, len); have = true; }
       else if (discoveredHost[0] != '\0') { strlcpy(buf, discoveredHost, len); have = true; }
       xSemaphoreGive(p1Mutex);
@@ -209,7 +207,7 @@ private:
     if (found < 0 && n > 0) found = 0;  // no explicit P1: fall back to the first device
     if (found >= 0) {
       String ip = MDNS.IP(found).toString();
-      if (p1Mutex != nullptr && xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
+      if (xSemaphoreTake(p1Mutex, MUTEX_WAIT) == pdTRUE) {
         strlcpy(discoveredHost, ip.c_str(), sizeof(discoveredHost));
         xSemaphoreGive(p1Mutex);
       }
@@ -301,7 +299,7 @@ private:
       if (um->taskStatus != ST_OK && um->autoDiscover &&
           millis() - p1LastGoodMs > 20000 && millis() - lastDiscoveryMs > 30000) {
         bool manual = false;
-        if (um->p1Mutex != nullptr && xSemaphoreTake(um->p1Mutex, portMAX_DELAY) == pdTRUE) {
+        if (xSemaphoreTake(um->p1Mutex, MUTEX_WAIT) == pdTRUE) {
           manual = (um->manualHost[0] != '\0');
           xSemaphoreGive(um->p1Mutex);
         }
@@ -310,11 +308,11 @@ private:
           um->discoverMeter();
         }
       }
+      um->taskStackFree = uxTaskGetStackHighWaterMark(nullptr);
       uint16_t interval = um->updateIntervalMs;
       vTaskDelay(pdMS_TO_TICKS(interval));
     }
   }
-#endif // ARDUINO_ARCH_ESP32
 
   // Timestamp for the visual smoothing filter (main loop)
   unsigned long lastSmoothUpdate = 0;
@@ -322,26 +320,31 @@ private:
 public:
   void setup() override {
     strip.addEffect(255, &mode_grid_flow, _data_FX_MODE_GRID_FLOW);
-#ifdef ARDUINO_ARCH_ESP32
-    if (!ensureMutex()) {
-      taskStatus = ST_TASK_FAIL;  // out of memory; surfaced on the info page
-      return;
+    // Handle init failures once, here: on any failure the usermod disables
+    // itself (info page shows why, effect falls back to the segment color),
+    // so the runtime code needs no null-handle checks.
+    p1Mutex = xSemaphoreCreateMutex();
+    if (p1Mutex != nullptr) {
+      if (xSemaphoreTake(p1Mutex, MUTEX_WAIT) == pdTRUE) {   // uncontended: task not started yet
+        strlcpy(manualHost, host.c_str(), sizeof(manualHost));
+        xSemaphoreGive(p1Mutex);
+      }
+      // Low priority; blocking calls in the task cannot stall the LED loop.
+      // Stack: measured high-water mark is ~2.3 KB used (mDNS + HTTP + JSON),
+      // 4096 leaves ~1.8 KB margin; debug builds report the headroom on the
+      // info page.
+      if (xTaskCreate(fetchTask, "P1Fetch", 4096, this, 1, &fetchTaskHandle) != pdPASS) fetchTaskHandle = nullptr;
     }
-    if (xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
-      strlcpy(manualHost, host.c_str(), sizeof(manualHost));
-      xSemaphoreGive(p1Mutex);
+    if (p1Mutex == nullptr || fetchTaskHandle == nullptr) {
+      enabled = false;
+      taskStatus = ST_TASK_FAIL;
+      DEBUG_PRINTLN(F("P1: init failed (out of memory), usermod disabled"));
     }
     cfgEnabled = enabled;
-    // Low priority, pinned to core 0 (WLED's LED loop runs on core 1)
-    if (xTaskCreatePinnedToCore(fetchTask, "P1Fetch", 10240, this, 1, &fetchTaskHandle, 0) != pdPASS) {
-      fetchTaskHandle = nullptr;
-      taskStatus = ST_TASK_FAIL;
-      DEBUG_PRINTLN(F("P1: fetch task creation failed"));
-    }
-#endif
   }
 
   void loop() override {
+    p1Enabled = enabled;
     if (!enabled) {
       // Reset the visuals so a disabled usermod doesn't keep showing stale
       // import/export state through the still-registered effect
@@ -380,11 +383,10 @@ public:
     if (user.isNull()) user = root.createNestedObject("u");
     JsonArray info = user.createNestedArray(FPSTR(_name));
 
-#ifndef ARDUINO_ARCH_ESP32
-    info.add(F("requires ESP32"));
-    return;
-#else
-    if (!enabled) { info.add(F("disabled")); return; }
+    if (!enabled) {
+      info.add(taskStatus == ST_TASK_FAIL ? F("init failed (out of memory)") : F("disabled"));
+      return;
+    }
 
     char hostBuf[64] = "";
     getEffectiveHost(hostBuf, sizeof(hostBuf));
@@ -416,6 +418,9 @@ public:
       }
       info.add(s);
     }
+#ifdef WLED_DEBUG
+    uint32_t stackFree = taskStackFree;
+    if (stackFree > 0) info.add(String(F("task stack headroom: ")) + stackFree + F(" B"));
 #endif
   }
 
@@ -452,14 +457,13 @@ public:
     p1FullScaleW = constrain(p1FullScaleW, p1DeadbandW + 1, 1000000);
     host.trim();
 
-#ifdef ARDUINO_ARCH_ESP32
-    ensureMutex();
-    if (xSemaphoreTake(p1Mutex, portMAX_DELAY) == pdTRUE) {
+    // The initial config load runs before setup() (no mutex yet); setup()
+    // makes the first copy of 'host', so only later saves need to sync here
+    if (p1Mutex != nullptr && xSemaphoreTake(p1Mutex, MUTEX_WAIT) == pdTRUE) {
       strlcpy(manualHost, host.c_str(), sizeof(manualHost));
       if (host != prevHost) discoveredHost[0] = '\0';  // host changed: rediscover
       xSemaphoreGive(p1Mutex);
     }
-#endif
 
     return configComplete;
   }
